@@ -240,6 +240,13 @@ async fn try_backend(canvas: &web_sys::HtmlCanvasElement, backends: wgpu::Backen
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = backends;
     let instance = wgpu::Instance::new(descriptor);
+    // A WebGPU surface claims the canvas, after which the WebGL2 fallback cannot use it.
+    if !webgl {
+        instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower, compatible_surface: None,
+            force_fallback_adapter: false, apply_limit_buckets: false,
+        }).await.map_err(|e| e.to_string())?;
+    }
     let surface = instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone())).map_err(|e| e.to_string())?;
     let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::LowPower, compatible_surface: Some(&surface),

@@ -11,7 +11,7 @@ default = ["accessibility", "dbus", "embedded-fonts", "metal-backend", "ogg-audi
 # Native builds always bundle Inter.
 embedded-fonts = []
 # Fall back to WebGL2 on wasm32 when WebGPU is unavailable.
-webgl = ["wgpu/webgl"]
+webgl = ["wgpu/webgl", "wgpu/fragile-send-sync-non-atomic-wasm"]
 # Headless benchmark instrumentation; ordinary builds contain no phase clocks.
 frame-profile = ["dep:procwatch"]
 # Native Open, Save and folder dialogs: rfd on macOS and Windows, the XDG desktop portal over zbus on Linux.
