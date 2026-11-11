@@ -11,7 +11,7 @@ default = ["accessibility", "dbus", "embedded-fonts", "metal-backend", "ogg-audi
 # the bytes (about 1.25 MB native).
 embedded-fonts = []
 # Fall back to WebGL2 on wasm32 when WebGPU is unavailable.
-webgl = ["wgpu/webgl"]
+webgl = ["wgpu/webgl", "wgpu/fragile-send-sync-non-atomic-wasm"]
 # Agent tooling in release builds: `--snap`, `--tree`, `--script`, `--trace`, `--strip`, `--video`,
 # `--html`, `--desktop` and the other headless runs `run` takes from the command line (README, "Agent
 # tooling"). Debug builds always have it. Off, a release app links only its window (examples/hello:
