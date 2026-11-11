@@ -438,6 +438,9 @@ fn gpu_side<S: 'static>(gpu: Gpu, surface: wgpu::Surface<'static>, size: (u32, u
     health::watch(&gpu.device, lost);
     let mut renderer = Renderer::new(&gpu.device, format);
     renderer.set_srgb_blend(!format.is_srgb());
+    // The runtime prepares colours for the blend the renderer really does; a mismatch
+    // encodes them twice.
+    rt.set_srgb_blend(renderer.srgb_blend());
     renderer.attach_text(&mut rt.text.atlas);
     let gl = gpu.adapter.get_info().backend == wgpu::Backend::Gl;
     Ok(GpuSide { gpu, surface, config, renderer, gl })
@@ -458,11 +461,16 @@ fn canvas_config(gpu: &Gpu, surface: &wgpu::Surface<'static>, size: (u32, u32), 
     if drift_wanted() { config.usage |= wgpu::TextureUsages::COPY_SRC; }
     let wanted = if srgb_blend { config.format.remove_srgb_suffix() } else { config.format.add_srgb_suffix() };
     let is_gl = gpu.adapter.get_info().backend == wgpu::Backend::Gl;
-    let format = if wanted != config.format && !is_gl {
+    let format = if wanted == config.format {
+        config.format
+    } else if is_gl {
+        // WebGL has no texture views to reinterpret the drawable, but it offers the plain
+        // and the sRGB formats both: configure the one the blend mode wants.
+        if caps.formats.contains(&wanted) { config.format = wanted; }
+        config.format
+    } else {
         config.view_formats.push(wanted);
         wanted
-    } else {
-        config.format
     };
     Some((config, format))
 }
@@ -470,13 +478,22 @@ fn canvas_config(gpu: &Gpu, surface: &wgpu::Surface<'static>, size: (u32, u32), 
 /// A frame drawn on the GPU from the runtime's instances, presented; `Err` when the canvas gave
 /// no texture to draw into.
 fn gpu_frame<S: 'static>(side: &mut GpuSide, rt: &mut Runtime<S>, compositor: &mut Option<Box<dyn crate::Compositor<S>>>, now: Instant, dt: f64, readback: bool, tick: bool) -> Result<Option<Readback>, String> {
-    if !side.gl && side.renderer.srgb_blend() != rt.srgb_blend() {
+    if side.renderer.srgb_blend() != rt.srgb_blend() {
         let format = if rt.srgb_blend() { side.config.format.remove_srgb_suffix() } else { side.config.format.add_srgb_suffix() };
-        if format != side.config.format && !side.config.view_formats.contains(&format) {
-            side.config.view_formats.push(format);
+        if !side.gl {
+            if format != side.config.format && !side.config.view_formats.contains(&format) {
+                side.config.view_formats.push(format);
+                side.surface.configure(&side.gpu.device, &side.config);
+            }
+            crate::window::rebuild_renderer(&side.gpu.device, &mut side.renderer, format, rt);
+        } else if side.surface.get_capabilities(&side.gpu.adapter).formats.contains(&format) {
+            side.config.format = format;
             side.surface.configure(&side.gpu.device, &side.config);
+            crate::window::rebuild_renderer(&side.gpu.device, &mut side.renderer, format, rt);
+        } else {
+            let blend = side.renderer.srgb_blend();
+            rt.set_srgb_blend(blend);
         }
-        crate::window::rebuild_renderer(&side.gpu.device, &mut side.renderer, format, rt);
     }
     let frame = match side.surface.get_current_texture() {
         wgpu::CurrentSurfaceTexture::Success(frame) | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
