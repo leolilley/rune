@@ -13,20 +13,30 @@ const SECRET: &str = "fixture-secret";
 const PILLS: &str = "a <span data-pill=\"agent:x\">@x</span> b";
 
 /// The logic before the machines, kept as it was: a state, a cancel flag beside it, and a held
-/// record per clipboard.
+/// record per clipboard. Only `clear_now` is new: it asks every clipboard still holding the
+/// secret, each cleared on its own, and a wipe after it settles the report as cleared.
 mod flags {
     use super::*;
 
-    pub type Queue = mpsc::Sender<Arc<Slot>>;
+    pub type Queue = Arc<mpsc::Sender<Arc<Slot>>>;
 
     #[derive(Default)]
     pub struct Slot {
         pub state: Mutex<SecretState>,
         pub cancel: AtomicBool,
-        pub route: OnceLock<Queue>,
+        pub routes: Mutex<Vec<Queue>>,
+        pub holders: AtomicUsize,
+        pub wiped_after_cancel: AtomicBool,
     }
     impl Slot {
-        pub fn set(&self, state: SecretState) { *lock(&self.state) = state; }
+        pub fn set(&self, state: SecretState) {
+            *lock(&self.state) = if self.wiped_after_cancel.load(Ordering::SeqCst) { SecretState::Cleared } else { state };
+        }
+        fn released(&self, state: SecretState) {
+            self.holders.fetch_sub(1, Ordering::SeqCst);
+            if state == SecretState::Cleared && self.cancel.load(Ordering::SeqCst) { self.wiped_after_cancel.store(true, Ordering::SeqCst); }
+            self.set(state);
+        }
     }
 
     pub struct Unwritten(pub Arc<Slot>);
@@ -54,8 +64,8 @@ mod flags {
     impl Copy {
         pub fn clear_now(&self) {
             self.0.cancel.store(true, Ordering::SeqCst);
-            let holding = *lock(&self.0.state) == SecretState::Holding;
-            if holding && let Some(route) = self.0.route.get() { let _ = route.send(self.0.clone()); }
+            if self.0.holders.load(Ordering::SeqCst) == 0 { return; }
+            for route in lock(&self.0.routes).iter() { let _ = route.send(self.0.clone()); }
         }
     }
 
@@ -126,7 +136,10 @@ mod flags {
                 })
                 .filter(|o| !o.pills.is_empty());
             if let Some(delay) = copy.clear_after {
-                if let Some(s) = &slot { s.set(SecretState::Holding); }
+                if let Some(s) = &slot {
+                    s.holders.fetch_add(1, Ordering::SeqCst);
+                    s.set(SecretState::Holding);
+                }
                 self.held = Some(Held {
                     slot: slot.clone(),
                     notify: notify.clone(),
@@ -144,7 +157,7 @@ mod flags {
 
         fn release(&mut self, state: SecretState) {
             let Some(held) = self.held.take() else { return };
-            if let Some(s) = &held.slot { s.set(state); }
+            if let Some(s) = &held.slot { s.released(state); }
             if let Some(n) = &held.notify { n.send(); }
         }
 
@@ -202,6 +215,10 @@ struct Fake {
     content: Option<ClipboardContent>,
     count: u64,
     counted: bool,
+    /// The change count when `SECRET` last landed.
+    landed: Option<u64>,
+    /// The last change was another app's.
+    others: bool,
     fail: Option<String>,
     log: Log,
     during_write: Option<Box<dyn FnOnce(&mut Fake)>>,
@@ -213,6 +230,8 @@ impl Fake {
             None => {
                 self.content = Some(content.clone());
                 self.count += 1;
+                self.others = false;
+                if content.text() == SECRET { self.landed = Some(self.count); }
                 lock(&self.log).push(Logged::Wrote(self.id));
                 Ok(())
             }
@@ -223,6 +242,13 @@ impl Fake {
     fn other_app(&mut self, text: &str) {
         self.content = Some(ClipboardContent::new(text));
         self.count += 1;
+        self.others = true;
+    }
+    /// Still exactly the secret Rune wrote.
+    fn ours(&self) -> bool { self.landed == Some(self.count) }
+    /// Another app's copy Rune can tell from its own.
+    fn others_copy(&self) -> Option<&ClipboardContent> {
+        self.content.as_ref().filter(|c| self.others && (self.counted || c.text() != SECRET))
     }
 }
 impl Backend for Fake {
@@ -237,6 +263,7 @@ impl Backend for Fake {
     fn clear(&mut self) {
         self.content = None;
         self.count += 1;
+        self.others = false;
         lock(&self.log).push(Logged::Wiped(self.id));
     }
 }
@@ -248,7 +275,7 @@ trait Engine: Default {
     type Queued;
     fn secret(text: &str, after: Duration) -> (Self::Write, Self::Copy);
     fn pills() -> Self::Write;
-    fn bind(write: &Self::Write, queue: &mpsc::Sender<Self::Queued>);
+    fn bind(write: &Self::Write, queue: &Arc<mpsc::Sender<Self::Queued>>);
     fn clear_now(copy: &Self::Copy);
     fn state(copy: &Self::Copy) -> SecretState;
     fn cancelled(copy: &Self::Copy) -> bool;
@@ -266,7 +293,7 @@ impl Engine for Core {
     type Queued = Request;
     fn secret(text: &str, after: Duration) -> (ClipboardWrite, SecretCopy) { ClipboardWrite::secret(text.into(), after) }
     fn pills() -> ClipboardWrite { ClipboardWrite::new(ClipboardContent::new("a @x b").with_html(PILLS)) }
-    fn bind(write: &ClipboardWrite, queue: &mpsc::Sender<Request>) { write.bind(Route::System(queue.clone())); }
+    fn bind(write: &ClipboardWrite, queue: &Arc<mpsc::Sender<Request>>) { write.bind(Route::System(queue.clone())); }
     fn clear_now(copy: &SecretCopy) { copy.clear_now(); }
     fn state(copy: &SecretCopy) -> SecretState { copy.state() }
     fn cancelled(copy: &SecretCopy) -> bool { copy.0.cancelled() }
@@ -291,7 +318,9 @@ impl Engine for flags::Core {
         flags::Write { content: ClipboardContent::new("a @x b").with_html(PILLS), clear_after: None, secret: None }
     }
     fn bind(write: &flags::Write, queue: &flags::Queue) {
-        if let Some(slot) = write.slot() { let _ = slot.route.set(queue.clone()); }
+        let Some(slot) = write.slot() else { return };
+        let mut routes = lock(&slot.routes);
+        if !routes.iter().any(|r| Arc::ptr_eq(r, queue)) { routes.push(queue.clone()); }
     }
     fn clear_now(copy: &flags::Copy) { copy.clear_now(); }
     fn state(copy: &flags::Copy) -> SecretState { lock(&copy.0.state).clone() }
@@ -369,7 +398,7 @@ struct Rig<E: Engine> {
     boards: [Fake; 2],
     engines: [E; 2],
     alive: [bool; 2],
-    queues: [(mpsc::Sender<E::Queued>, mpsc::Receiver<E::Queued>); 2],
+    queues: [(Arc<mpsc::Sender<E::Queued>>, mpsc::Receiver<E::Queued>); 2],
     notify: [Notify; 2],
     s: E::Copy,
     t: E::Copy,
@@ -392,7 +421,8 @@ impl<E: Engine> Rig<E> {
         let (t_write, t) = E::secret("fixture-other", LONG);
         let (forever_write, forever) = E::secret("fixture-forever", Duration::MAX);
         let cancel_on_wake = Arc::new(AtomicBool::new(false));
-        let board = |id| Fake { id, content: None, count: 0, counted: counted[id], fail: None, log: log.clone(), during_write: None };
+        let board = |id| Fake { id, content: None, count: 0, counted: counted[id], landed: None, others: false, fail: None, log: log.clone(), during_write: None };
+        let queue = || { let (sender, receiver) = mpsc::channel(); (Arc::new(sender), receiver) };
         let notify = |id: usize| {
             let (log, s, t, arm) = (log.clone(), s.clone(), t.clone(), cancel_on_wake.clone());
             Notify {
@@ -407,7 +437,7 @@ impl<E: Engine> Rig<E> {
             boards: [board(0), board(1)],
             engines: [E::default(), E::default()],
             alive: [true, true],
-            queues: [mpsc::channel(), mpsc::channel()],
+            queues: [queue(), queue()],
             notify: [notify(0), notify(1)],
             s_write: Some(s_write),
             t_write: Some(t_write),
@@ -542,11 +572,36 @@ fn check(sequence: &[Ev], counted: [bool; 2], start: Instant) -> Result<(), Stri
         reference.apply(ev);
         same(&machines, &reference).map_err(|why| format!("{:?} with change counts {counted:?}, after event {i}: {why}", sequence))?;
     }
+    keeps_clear_nows_promise(&mut machines, &mut reference).map_err(|why| format!("{:?} with change counts {counted:?}, then clear_now: {why}", sequence))
+}
+
+/// Whatever came before: `clear_now` leaves no board holding the secret, takes no other app's
+/// copy, and reports `Cleared` if it had anything to wipe.
+fn keeps_clear_nows_promise(machines: &mut Rig<Core>, reference: &mut Rig<flags::Core>) -> Result<(), String> {
+    let ours = (0..2).any(|b| machines.alive[b] && machines.boards[b].ours());
+    let others = [0, 1].map(|b| machines.boards[b].others_copy().cloned());
+    for ev in [CancelS, Pump] {
+        machines.apply(ev);
+        reference.apply(ev);
+        same(machines, reference)?;
+    }
+    for b in 0..2 {
+        if machines.alive[b] && machines.boards[b].ours() { return Err(format!("board {b} still holds the secret")); }
+        if others[b].is_some() && machines.boards[b].content != others[b] { return Err(format!("board {b} lost another app's copy")); }
+    }
+    let state = machines.s.state();
+    if ours && state != SecretState::Cleared { return Err(format!("reported {state:?} after a wipe")); }
     Ok(())
 }
 
-/// Every sequence of exactly `len` events, which covers each shorter one as a prefix, across
-/// threads. Returns how many ran.
+/// Every sequence of up to six events, on either layout of change counts.
+fn exhaust_all(alphabet: &[Ev]) {
+    for counted in COUNTS {
+        for len in 1..=6 { assert_eq!(exhaust(alphabet, len, counted), alphabet.len().pow(len)); }
+    }
+}
+
+/// Every sequence of exactly `len` events, across threads. Returns how many ran.
 fn exhaust(alphabet: &[Ev], len: u32, counted: [bool; 2]) -> usize {
     let total = alphabet.len().pow(len);
     let start = Instant::now();
@@ -583,7 +638,7 @@ fn exhaust(alphabet: &[Ev], len: u32, counted: [bool; 2]) -> usize {
 const COUNTS: [[bool; 2]; 2] = [[true, false], [false, true]];
 
 /// Writes and replays across boards against everything that can end a hold.
-const BOARDS: &[Ev] = &[WriteSA, WriteSB, WriteTA, ReadA, ReadB, CancelS, Timeout, OtherA, OtherB, ClearHeldA, ToggleFailA];
+const BOARDS: &[Ev] = &[WriteSA, WriteSB, WriteTA, ReadA, ReadB, CancelS, Pump, Timeout, OtherA, OtherB, ClearHeldA, ToggleFailA];
 /// Interruptions during a write, against what follows them on the same board.
 const IN_FLIGHT: &[Ev] = &[WriteSA, WriteSASlow, WriteSASlowHash, WriteSACancelInWrite, WriteSAOtherInWrite, WriteSACancelOtherInWrite, WriteSACancelInWake, ReadA, CancelS, Pump, OtherA, ToggleFailA, Timeout];
 /// How a copy's life ends: shutdown, dropped writes, pills, a look-alike from another app.
@@ -591,17 +646,17 @@ const ENDINGS: &[Ev] = &[WriteSA, WriteSB, WriteTA, WriteForeverA, WritePillsA, 
 
 #[test]
 fn every_six_events_across_boards_match_the_flags() {
-    for counted in COUNTS { assert_eq!(exhaust(BOARDS, 6, counted), BOARDS.len().pow(6)); }
+    exhaust_all(BOARDS);
 }
 
 #[test]
 fn every_six_events_around_a_write_match_the_flags() {
-    for counted in COUNTS { assert_eq!(exhaust(IN_FLIGHT, 6, counted), IN_FLIGHT.len().pow(6)); }
+    exhaust_all(IN_FLIGHT);
 }
 
 #[test]
 fn every_six_events_ending_a_copy_match_the_flags() {
-    for counted in COUNTS { assert_eq!(exhaust(ENDINGS, 6, counted), ENDINGS.len().pow(6)); }
+    exhaust_all(ENDINGS);
 }
 
 /// The whole alphabet at once; too long for the normal run. Run with `--ignored --release`.
@@ -612,7 +667,7 @@ fn every_six_events_from_the_whole_alphabet_match_the_flags() {
         WriteSA, WriteSB, WriteTA, WriteForeverA, WritePillsA, WriteSASlow, WriteSASlowHash, WriteSACancelInWrite, WriteSAOtherInWrite, WriteSACancelOtherInWrite, WriteSACancelInWake,
         ReadA, ReadB, CancelS, Timeout, OtherA, OtherB, OtherSameText, ToggleFailA, ClearHeldA, ShutdownA, Pump, DropWrites,
     ];
-    for counted in COUNTS { assert_eq!(exhaust(ALL, 6, counted), ALL.len().pow(6)); }
+    exhaust_all(ALL);
 }
 
 /// Runs `sequence` through the machines and hands back the rig to look at.
@@ -688,15 +743,47 @@ fn a_clone_on_two_boards_is_cleaned_up_on_each() {
 }
 
 #[test]
-fn cancel_latches_in_every_report_and_asks_for_a_clear_only_while_holding() {
+fn cancel_latches_in_every_report_and_asks_for_a_clear_only_while_a_board_holds_it() {
     for report in [SecretState::Pending, SecretState::Holding, SecretState::Cleared, SecretState::Replaced, SecretState::Failed("x".into())] {
-        for mut secret in [Secret::Live(report.clone()), Secret::Cancelled(report.clone())] {
-            let effects = step(&mut secret, SecretEvent::Cancel);
-            assert_eq!(secret, Secret::Cancelled(report.clone()));
-            let expected = if report == SecretState::Holding { Effects::one(SecretEffect::Clear) } else { Effects::none() };
-            assert_eq!(effects, expected);
+        for holds in [0, 1] {
+            for mut secret in [Secret::Live { report: report.clone(), holds }, Secret::Cancelled { report: report.clone(), holds }] {
+                let effects = step(&mut secret, SecretEvent::Cancel);
+                assert_eq!(secret, Secret::Cancelled { report: report.clone(), holds });
+                let expected = if holds > 0 { Effects::one(SecretEffect::Clear) } else { Effects::none() };
+                assert_eq!(effects, expected);
+            }
         }
     }
+}
+
+#[test]
+fn clear_now_wipes_what_a_failed_replay_left_held() {
+    let rig = run(&[WriteSA, ToggleFailA, WriteSA, CancelS, Pump]);
+    assert_eq!((text_of(&rig.boards[0]), rig.s.state(), wipes(&rig, 0)), (None, SecretState::Cleared, 1));
+}
+
+#[test]
+fn clear_now_spares_another_apps_copy_after_a_failed_replay() {
+    let rig = run(&[WriteSA, ToggleFailA, WriteSA, OtherA, CancelS, Pump]);
+    assert_eq!((text_of(&rig.boards[0]), rig.s.state(), wipes(&rig, 0)), (Some("theirs"), SecretState::Replaced, 0));
+}
+
+#[test]
+fn clear_now_wipes_every_board_a_clone_reached() {
+    let rig = run(&[WriteSA, WriteSB, CancelS, Pump]);
+    assert_eq!((text_of(&rig.boards[0]), text_of(&rig.boards[1]), rig.s.state()), (None, None, SecretState::Cleared));
+}
+
+#[test]
+fn clear_now_reaches_a_later_board_after_the_first_was_replaced() {
+    let rig = run(&[WriteSA, WriteSB, OtherA, ReadA, CancelS, Pump]);
+    assert_eq!((text_of(&rig.boards[0]), text_of(&rig.boards[1]), rig.s.state()), (Some("theirs"), None, SecretState::Cleared));
+}
+
+#[test]
+fn clear_now_reports_cleared_when_a_later_board_was_replaced() {
+    let rig = run(&[WriteSA, WriteSB, OtherB, CancelS, Pump]);
+    assert_eq!((text_of(&rig.boards[0]), text_of(&rig.boards[1]), rig.s.state()), (None, Some("theirs"), SecretState::Cleared));
 }
 
 #[test]
@@ -729,7 +816,7 @@ fn a_write_reports_holding_then_starts_the_delay_then_hashes() {
 
 #[test]
 fn a_hold_with_no_deadline_keeps_no_earlier_alarm() {
-    let mut cb = Fake { id: 0, content: None, count: 0, counted: true, fail: None, log: Log::default(), during_write: None };
+    let mut cb = Fake { id: 0, content: None, count: 0, counted: true, landed: None, others: false, fail: None, log: Log::default(), during_write: None };
     let mut core = Core::default();
     core.write(&mut cb, ClipboardWrite::secret("first".into(), LONG).0, None, &RealTime);
     assert!(core.alarm.is_some());

@@ -2,7 +2,7 @@
 //! of its write: what it reports, and whether `clear_now` ran. A [`Hold`] is one clipboard's
 //! record of the secret it wrote last, so a clone written to two clipboards is cleaned up on each
 //! and neither's report can disarm the other.
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use crate::machine::{Attempt, Effects, Seq};
 use crate::time::Instant;
 use super::{Notify, Request, Route, lock};
@@ -24,21 +24,27 @@ pub enum SecretState {
     Failed(String),
 }
 
-/// A secret copy: the last thing reported about it, and whether it may be written again.
+/// A secret copy: the last thing reported about it, whether it may be written again, and how many
+/// clipboards have a [`Hold`] on it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Secret {
     /// `clear_now` hasn't run: a clone of its write can still be written, even after it expired.
-    Live(SecretState),
+    Live { report: SecretState, holds: u32 },
     /// `clear_now` ran: no clone of its write is written again, whatever it last reported.
-    Cancelled(SecretState),
+    Cancelled { report: SecretState, holds: u32 },
+    /// `clear_now` ran and a clipboard has been wiped since. It reports `Cleared` from here on,
+    /// even if another clipboard turns out to have been replaced.
+    Swept { holds: u32 },
 }
 impl Default for Secret {
-    fn default() -> Self { Self::Live(SecretState::Pending) }
+    fn default() -> Self { Self::Live { report: SecretState::Pending, holds: 0 } }
 }
 impl Secret {
-    fn report(&self) -> &SecretState {
-        let (Self::Live(report) | Self::Cancelled(report)) = self;
-        report
+    fn report(&self) -> SecretState {
+        match self {
+            Self::Live { report, .. } | Self::Cancelled { report, .. } => report.clone(),
+            Self::Swept { .. } => SecretState::Cleared,
+        }
     }
 }
 
@@ -46,7 +52,11 @@ impl Secret {
 pub(super) enum SecretEvent {
     /// `clear_now` ran.
     Cancel,
-    /// A clipboard reported on this copy; the latest report stands.
+    /// A clipboard took a hold on this copy.
+    Held,
+    /// A clipboard's hold ended, with this outcome.
+    Released(SecretState),
+    /// A write of this copy failed; the latest report stands.
     Report(SecretState),
     /// The last clone of its write was dropped.
     Dropped,
@@ -54,44 +64,51 @@ pub(super) enum SecretEvent {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum SecretEffect {
-    /// Ask the clipboard this copy was first written to for a clear.
+    /// Ask every clipboard this copy was written to for a clear.
     Clear,
 }
 
 pub(super) fn step(secret: &mut Secret, event: SecretEvent) -> Effects<SecretEffect> {
-    match event {
-        SecretEvent::Cancel => {
-            let (Secret::Live(report) | Secret::Cancelled(report)) = std::mem::take(secret);
-            let holding = report == SecretState::Holding;
-            *secret = Secret::Cancelled(report);
-            if holding { Effects::one(SecretEffect::Clear) } else { Effects::none() }
-        }
-        SecretEvent::Report(next) => {
-            let (Secret::Live(report) | Secret::Cancelled(report)) = secret;
-            *report = next;
-            Effects::none()
-        }
-        SecretEvent::Dropped => {
-            match secret {
-                Secret::Live(report @ SecretState::Pending) => *report = SecretState::Replaced,
-                Secret::Cancelled(report @ SecretState::Pending) => *report = SecretState::Cleared,
-                _ => {}
-            }
-            Effects::none()
-        }
-    }
+    use {Secret::*, SecretEvent::*};
+    let ask = |holds: u32| if holds > 0 { Effects::one(SecretEffect::Clear) } else { Effects::none() };
+    let less = |holds: u32| holds.saturating_sub(1);
+    let (next, effects) = match (std::mem::take(secret), event) {
+        (Live { report, holds } | Cancelled { report, holds }, Cancel) => (Cancelled { report, holds }, ask(holds)),
+        (Swept { holds }, Cancel) => (Swept { holds }, ask(holds)),
+        (Live { holds, .. }, Held) => (Live { report: SecretState::Holding, holds: holds + 1 }, Effects::none()),
+        (Cancelled { holds, .. }, Held) => (Cancelled { report: SecretState::Holding, holds: holds + 1 }, Effects::none()),
+        (Swept { holds }, Held) => (Swept { holds: holds + 1 }, Effects::none()),
+        (Live { holds, .. }, Released(report)) => (Live { report, holds: less(holds) }, Effects::none()),
+        (Cancelled { holds, .. } | Swept { holds }, Released(SecretState::Cleared)) => (Swept { holds: less(holds) }, Effects::none()),
+        (Cancelled { holds, .. }, Released(report)) => (Cancelled { report, holds: less(holds) }, Effects::none()),
+        (Swept { holds }, Released(_)) => (Swept { holds: less(holds) }, Effects::none()),
+        (Live { holds, .. }, Report(report)) => (Live { report, holds }, Effects::none()),
+        (Cancelled { holds, .. }, Report(report)) => (Cancelled { report, holds }, Effects::none()),
+        (Live { report: SecretState::Pending, holds }, Dropped) => (Live { report: SecretState::Replaced, holds }, Effects::none()),
+        (Cancelled { report: SecretState::Pending, holds }, Dropped) => (Cancelled { report: SecretState::Cleared, holds }, Effects::none()),
+        (unchanged, Report(_) | Dropped) => (unchanged, Effects::none()),
+    };
+    *secret = next;
+    effects
 }
 
 #[derive(Default)]
 pub(super) struct Slot {
     secret: Mutex<Secret>,
-    pub(super) route: OnceLock<Route>,
+    /// Every clipboard a clone of its write was sent to, the first one first.
+    routes: Mutex<Vec<Route>>,
 }
 impl Slot {
     fn step(&self, event: SecretEvent) -> Effects<SecretEffect> { step(&mut lock(&self.secret), event) }
     pub(super) fn set(&self, state: SecretState) { self.step(SecretEvent::Report(state)); }
-    pub(super) fn cancelled(&self) -> bool { matches!(*lock(&self.secret), Secret::Cancelled(_)) }
-    fn state(&self) -> SecretState { lock(&self.secret).report().clone() }
+    pub(super) fn held(&self) { self.step(SecretEvent::Held); }
+    pub(super) fn released(&self, state: SecretState) { self.step(SecretEvent::Released(state)); }
+    pub(super) fn cancelled(&self) -> bool { !matches!(*lock(&self.secret), Secret::Live { .. }) }
+    pub(super) fn bind(&self, route: Route) {
+        let mut routes = lock(&self.routes);
+        if !routes.iter().any(|r| r.same(&route)) { routes.push(route); }
+    }
+    fn state(&self) -> SecretState { lock(&self.secret).report() }
 }
 
 /// Settles a secret write that was dropped before reaching a clipboard (replaced in its
@@ -110,19 +127,21 @@ impl SecretCopy {
     /// in flight without a `Tx`.
     pub fn pending() -> Self { Self(Arc::default()) }
     pub fn state(&self) -> SecretState {
-        if let Some(Route::Memory(m)) = self.0.route.get() { m.tick(); }
+        let first = lock(&self.0.routes).first().cloned();
+        if let Some(Route::Memory(m)) = first { m.tick(); }
         self.0.state()
     }
     /// Still the last copy Rune wrote, and the clipboard hasn't changed since. The OS
     /// clipboard is checked a few times a second while a secret is held.
     pub fn holds(&self) -> bool { self.state() == SecretState::Holding }
-    /// Clear the clipboard now if this copy still holds it, on the clipboard worker. A copy not
-    /// yet written is never written. Idempotent.
+    /// Clear this copy from every clipboard that still holds it, on the clipboard worker. A copy
+    /// not yet written is never written. Idempotent.
     pub fn clear_now(&self) {
         for effect in self.0.step(SecretEvent::Cancel) {
             match effect {
                 SecretEffect::Clear => {
-                    if let Some(route) = self.0.route.get() { route.send(Request::Clear(Some(self.0.clone()))); }
+                    let routes = lock(&self.0.routes).clone();
+                    for route in routes { route.send(Request::Clear(Some(self.0.clone()))); }
                 }
             }
         }
@@ -193,7 +212,7 @@ pub(super) enum HoldEvent {
 pub(super) enum HoldEffect {
     /// Wipe the clipboard.
     Wipe,
-    Report(Arc<Slot>, SecretState),
+    Release(Arc<Slot>, SecretState),
     Notify(Notify),
     /// Replace the alarm being waited on: a new hold never inherits the last one's.
     Arm(Option<Alarm>),
@@ -226,7 +245,7 @@ fn settle(hold: &mut Hold, ours: bool) -> Effects<HoldEffect> {
 
 fn release(hold: &mut Hold, state: SecretState) -> Effects<HoldEffect> {
     let Hold::Holding { slot, notify, .. } = std::mem::take(hold) else { return Effects::none() };
-    let mut effects = Effects::one(HoldEffect::Report(slot, state));
+    let mut effects = Effects::one(HoldEffect::Release(slot, state));
     if let Some(notify) = notify { effects.push(HoldEffect::Notify(notify)); }
     effects
 }

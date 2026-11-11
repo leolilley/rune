@@ -1,0 +1,1 @@
+- `SecretCopy::clear_now` now clears the secret from every clipboard still holding it, including one whose last replay failed or a later clipboard a cloned write reached, and reports `Cleared`. Another app's copy is still left alone.

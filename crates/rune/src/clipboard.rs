@@ -62,7 +62,7 @@ impl ClipboardWrite {
     pub(crate) fn is_secret(&self) -> bool { self.clear_after.is_some() }
     fn slot(&self) -> Option<&Arc<Slot>> { self.secret.as_ref().map(|u| &u.0) }
     fn bind(&self, route: Route) {
-        if let Some(slot) = self.slot() { let _ = slot.route.set(route); }
+        if let Some(slot) = self.slot() { slot.bind(route); }
     }
 }
 impl std::ops::Deref for ClipboardWrite {
@@ -76,8 +76,16 @@ impl std::fmt::Debug for ClipboardWrite {
 }
 
 #[derive(Clone)]
-enum Route { System(mpsc::Sender<Request>), Memory(MemoryClipboard) }
+enum Route { System(Arc<mpsc::Sender<Request>>), Memory(MemoryClipboard) }
 impl Route {
+    /// Whether both lead to the same clipboard.
+    fn same(&self, other: &Route) -> bool {
+        match (self, other) {
+            (Route::System(a), Route::System(b)) => Arc::ptr_eq(a, b),
+            (Route::Memory(a), Route::Memory(b)) => Arc::ptr_eq(&a.0, &b.0),
+            _ => false,
+        }
+    }
     fn send(&self, request: Request) {
         match self {
             Route::System(worker) => { let _ = worker.send(request); }
@@ -370,7 +378,7 @@ impl Core {
             })
             .filter(|o| !o.pills.is_empty());
         if let (Some(delay), Some(slot)) = (copy.clear_after, slot) {
-            slot.set(SecretState::Holding);
+            slot.held();
             let due = steps.now().checked_add(delay);
             steps.hashing();
             let print = self.keys.hash_one(copy.content.text());
@@ -387,7 +395,7 @@ impl Core {
                     cb.clear();
                     self.own_pills = None;
                 }
-                HoldEffect::Report(slot, state) => slot.set(state),
+                HoldEffect::Release(slot, state) => slot.released(state),
                 HoldEffect::Notify(notify) => notify.send(),
                 HoldEffect::Arm(alarm) => self.alarm = alarm,
             }

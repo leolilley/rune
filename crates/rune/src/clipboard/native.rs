@@ -22,7 +22,7 @@ impl Client {
 
 static WORKER: OnceLock<Worker> = OnceLock::new();
 pub(super) struct Worker {
-    pub(super) sender: mpsc::Sender<Request>,
+    pub(super) sender: Arc<mpsc::Sender<Request>>,
     join: Mutex<Option<(std::thread::JoinHandle<()>, mpsc::Receiver<()>)>>,
 }
 impl Worker {
@@ -34,7 +34,7 @@ impl Worker {
             // Backend dropped (including Linux handoff) before acknowledging completion.
             let _ = done.send(());
         }).expect("clipboard worker");
-        Self { sender, join: Mutex::new(Some((handle, completed))) }
+        Self { sender: Arc::new(sender), join: Mutex::new(Some((handle, completed))) }
     }
     pub(super) fn stop(&self) {
         let Some((handle, completed)) = self.join.lock().unwrap().take() else { return };
@@ -44,12 +44,12 @@ impl Worker {
     }
 }
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
-fn worker() -> &'static mpsc::Sender<Request> {
+fn worker() -> &'static Arc<mpsc::Sender<Request>> {
     &WORKER.get_or_init(|| Worker::spawn(|| arboard::Clipboard::new().ok())).sender
 }
 
 #[cfg(any(target_os = "ios", target_os = "android"))]
-fn worker() -> &'static mpsc::Sender<Request> {
+fn worker() -> &'static Arc<mpsc::Sender<Request>> {
     &WORKER.get_or_init(|| Worker::spawn(|| None::<Board>)).sender
 }
 
