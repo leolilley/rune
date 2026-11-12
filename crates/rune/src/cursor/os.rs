@@ -6,6 +6,10 @@
 //! like any other shape, so the OS drops it when the pointer leaves the window or the window
 //! goes away.
 //!
+//! On the web it is CSS `cursor: none` (winit's `set_cursor_visible`), which is per-canvas
+//! there and needs no image: a custom cursor is a `blob:` URL that a page's `img-src` policy
+//! may refuse.
+//!
 //! `Cursor::Image` goes through winit's custom cursors, made at the window's scale so the
 //! image keeps its size in points. winit makes those only with the event loop at hand, so a
 //! window's first use of an image waits for [`make_pending`] before the loop sleeps. On macOS
@@ -21,7 +25,9 @@ use std::time::Duration;
 use crate::time::Instant;
 
 use winit::event_loop::ActiveEventLoop;
-use winit::window::{CursorIcon, CustomCursor, Window};
+#[cfg(not(target_arch = "wasm32"))]
+use winit::window::CustomCursor;
+use winit::window::{CursorIcon, Window};
 
 use crate::el::Cursor;
 
@@ -33,12 +39,20 @@ pub(crate) struct OsCursor {
     /// The scale an image cursor was last made at: a window moving to a display with another
     /// scale makes it again.
     scale: f32,
+    #[cfg(not(target_arch = "wasm32"))]
     transparent: CustomCursor,
 }
 
 impl OsCursor {
     pub(crate) fn new(event_loop: &ActiveEventLoop) -> Self {
-        OsCursor { applied: (false, Cursor::Default), scale: 0.0, transparent: transparent(event_loop) }
+        #[cfg(target_arch = "wasm32")]
+        let _ = event_loop;
+        OsCursor {
+            applied: (false, Cursor::Default),
+            scale: 0.0,
+            #[cfg(not(target_arch = "wasm32"))]
+            transparent: transparent(event_loop),
+        }
     }
 
     /// Applies `want` while the host is `active` (the pointer is over its window or its hit
@@ -56,7 +70,12 @@ impl OsCursor {
         let Some(next) = crate::platform::macos::cursor::window_cursor(window, next) else { return };
         #[cfg(not(target_os = "macos"))]
         images::forget(window);
+        #[cfg(target_arch = "wasm32")]
+        window.set_cursor_visible(next != Cursor::Hidden);
         match next {
+            #[cfg(target_arch = "wasm32")]
+            Cursor::Hidden => {}
+            #[cfg(not(target_arch = "wasm32"))]
             Cursor::Hidden => window.set_cursor(self.transparent.clone()),
             #[cfg(not(target_os = "macos"))]
             Cursor::Image(image) => images::set(window, image, scale),
@@ -76,21 +95,11 @@ impl OsCursor {
     }
 }
 
-/// A 1×1 clear cursor. On web it is made once per page and kept: winit makes a custom cursor
-/// asynchronously, and dropping one before it's ready leaves the browser calling a freed
-/// closure, as a web app unmounted just after it mounts would.
+/// A 1×1 clear cursor.
+#[cfg(not(target_arch = "wasm32"))]
 fn transparent(event_loop: &ActiveEventLoop) -> CustomCursor {
-    let make = || {
-        let source = CustomCursor::from_rgba(vec![0u8; 4], 1, 1, 0, 0).expect("a 1x1 cursor image is valid");
-        event_loop.create_custom_cursor(source)
-    };
-    #[cfg(target_arch = "wasm32")]
-    {
-        thread_local! { static CLEAR: std::cell::OnceCell<CustomCursor> = const { std::cell::OnceCell::new() }; }
-        CLEAR.with(|clear| clear.get_or_init(make).clone())
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    make()
+    let source = CustomCursor::from_rgba(vec![0u8; 4], 1, 1, 0, 0).expect("a 1x1 cursor image is valid");
+    event_loop.create_custom_cursor(source)
 }
 
 fn holds_image(applied: (bool, Cursor)) -> bool {
