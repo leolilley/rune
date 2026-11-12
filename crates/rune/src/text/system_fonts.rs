@@ -19,9 +19,11 @@ pub(super) const SYMBOL_FAMILIES: &[&str] = &["Segoe UI Symbol", "Segoe UI Emoji
 #[cfg(windows)]
 pub(super) const SYMBOL_FONT_FILES: &[&str] = &["seguisym", "seguiemj"];
 // DejaVu Sans lacks ⎋ (U+238B), which DejaVu Sans Mono has; `dejavusans` loads both files.
+// Noto Emoji, the monochrome outline face, is found only when the app registers it (the web
+// has no system fonts); it comes after the colour face, so a system that has both keeps colour.
 #[cfg(not(any(target_vendor = "apple", windows)))]
 pub(super) const SYMBOL_FAMILIES: &[&str] =
-    &["DejaVu Sans", "Noto Sans Symbols2", "Noto Sans Symbols", "DejaVu Sans Mono", "Noto Color Emoji"];
+    &["DejaVu Sans", "Noto Sans Symbols2", "Noto Sans Symbols", "DejaVu Sans Mono", "Noto Color Emoji", "Noto Emoji"];
 #[cfg(not(any(target_vendor = "apple", windows)))]
 pub(super) const SYMBOL_FONT_FILES: &[&str] = &["dejavusans", "notosanssymbols", "notocoloremoji"];
 
