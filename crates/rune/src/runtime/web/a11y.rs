@@ -288,6 +288,13 @@ impl<S: 'static> Runtime<S> {
             let parent = open.last().map(|&(_, item)| item);
             let n = &self.nodes[i];
             let end = ends[i];
+            // A node behind the modal may still hold it (a page's root holds its dialog layer):
+            // walk into it without mirroring it, so the modal's own subtree is reached.
+            if !self.allowed(i) && self.modal_index.is_some_and(|m| m > i && m < end) {
+                i += 1;
+                last_flow_parent = None;
+                continue;
+            }
             if !self.allowed(i) || self.subtree_exiting(i) || n.vis.opacity <= 0.01 || n.a11y.hidden
                 || matches!(n.role, "none" | "presentation")
             {

@@ -193,3 +193,20 @@ fn mac_meta_copy_and_select_all_work_on_selectable_text() {
     crate::clipboard::flush_memory(&mut rt);
     assert_eq!(board.text().as_deref().map(String::as_str), Some("First paragraph\nSecond paragraph"));
 }
+
+#[test]
+fn a_modal_inside_the_root_is_mirrored_and_what_it_covers_is_not() {
+    fn view(_: &(), _: &mut Cx<()>) -> El {
+        crate::col().w_full().h_full()
+            .child(crate::row().key("behind").role("button").label("Behind").on_press(|_: &mut ()| {}).child(crate::text("Behind")))
+            .child(crate::col().key("sheet").label("Confirm").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                .modal(true, |_: &mut ()| {})
+                .child(crate::row().key("inside").role("button").label("Inside").on_press(|_: &mut ()| {}).child(crate::text("Inside"))))
+    }
+    let mut rt = Runtime::new((), view, (480.0, 320.0), Env::default());
+    rt.frame(0.0);
+    let items = rt.web_a11y_items();
+    let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+    assert!(texts.contains(&"Inside"), "the modal's content is mirrored: {texts:?}");
+    assert!(!texts.contains(&"Behind"), "what the modal covers is not: {texts:?}");
+}
