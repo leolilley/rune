@@ -6,6 +6,10 @@
 //! like any other shape, so the OS drops it when the pointer leaves the window or the window
 //! goes away.
 //!
+//! On the web it is CSS `cursor: none` (winit's `set_cursor_visible`), which is per-canvas
+//! there and needs no image: a custom cursor is a `blob:` URL that a page's `img-src` policy
+//! may refuse.
+//!
 //! `Cursor::Image` goes through winit's custom cursors, made at the window's scale so the
 //! image keeps its size in points. winit makes those only with the event loop at hand, so a
 //! window's first use of an image waits for [`make_pending`] before the loop sleeps. On macOS
@@ -56,7 +60,12 @@ impl OsCursor {
         #[cfg(not(target_os = "macos"))]
         images::forget(window);
         clear::forget(window);
+        #[cfg(target_arch = "wasm32")]
+        window.set_cursor_visible(next != Cursor::Hidden);
         match next {
+            #[cfg(target_arch = "wasm32")]
+            Cursor::Hidden => {}
+            #[cfg(not(target_arch = "wasm32"))]
             Cursor::Hidden => clear::set(window),
             #[cfg(not(target_os = "macos"))]
             Cursor::Image(image) => images::set(window, image, scale),
@@ -95,6 +104,7 @@ mod clear {
         static PENDING: RefCell<Vec<Weak<Window>>> = const { RefCell::new(Vec::new()) };
     }
 
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(super) fn set(window: &Arc<Window>) {
         match CLEAR.with(|c| c.get().cloned()) {
             Some(clear) => window.set_cursor(clear),
