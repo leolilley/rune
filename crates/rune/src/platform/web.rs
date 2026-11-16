@@ -554,7 +554,9 @@ impl Readback {
     /// appends `[differing, of, max]` to `globalThis.__runeDrift` once the copy is mapped.
     fn count(self, cpu: Vec<u8>) {
         let Readback { buffer, row, size: (w, h), rgba } = self;
-        let buffer = Rc::new(buffer);
+        // An `Arc`, not an `Rc`: with the WebGL2 fallback's wgpu feature the map callback must be `Send`.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let buffer = std::sync::Arc::new(buffer);
         let mapped = buffer.clone();
         buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
             if result.is_err() { return; }
